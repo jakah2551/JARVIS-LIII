@@ -1,0 +1,29 @@
+{
+  "default_llm": "openrouter",
+  "providers": {
+    "openrouter": {
+      "type": "openai-compatible",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "model": "openrouter/owl-alpha"
+    },
+    "ollama": {
+      "type": "openai-compatible",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api_key_env": null,
+      "model": "qwen3:27b"
+    },
+    "custom": {
+      "type": "openai-compatible",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "api_key_env": "CUSTOM_LLM_API_KEY",
+      "model": "your-model"
+    }
+  },
+  "audio": {
+    "input_sample_rate": 16000,
+    "output_sample_rate": 24000,
+    "channels": 1,
+    "input_chunk_samples": 1024
+  }
+}
