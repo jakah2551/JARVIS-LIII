@@ -1,18 +1,18 @@
 """Dependency-light OpenAI-compatible provider.
 
-This covers OpenAI, OpenRouter, Together, Groq, Ollama (when exposed through
-its OpenAI-compatible endpoint), vLLM, LM Studio, llama.cpp servers and other
-compatible gateways.  No provider SDK is required.
+This covers OpenAI, OpenRouter, Together, Groq, Ollama (through its compatible
+endpoint), vLLM, LM Studio, llama.cpp servers and other compatible gateways.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import urllib.error
 import urllib.request
 from typing import Any, AsyncIterator, Mapping, Sequence
 
-from .base import ChatMessage, LLMProvider, ProviderCapabilities, ProviderResponse
+from .base import ChatMessage, ProviderCapabilities, ProviderResponse
 
 
 class OpenAICompatibleProvider:
@@ -30,11 +30,7 @@ class OpenAICompatibleProvider:
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
-        self.capabilities = ProviderCapabilities(
-            chat=True,
-            streaming=True,
-            tools=True,
-        )
+        self.capabilities = ProviderCapabilities(chat=True, streaming=True, tools=True)
 
     def _payload(
         self,
@@ -48,9 +44,7 @@ class OpenAICompatibleProvider:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [
-                {"role": m.role, "content": m.content} for m in messages
-            ],
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
             "stream": stream,
         }
         if tools:
@@ -62,25 +56,11 @@ class OpenAICompatibleProvider:
         payload.update(kwargs)
         return payload
 
-    def _request(self, payload: Mapping[str, Any]) -> bytes:
-        body = json.dumps(payload).encode("utf-8")
+    def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        req = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=body,
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"{self.provider_id} HTTP {exc.code}: {detail[:1000]}"
-            ) from exc
+        return headers
 
     async def complete(
         self,
@@ -91,22 +71,28 @@ class OpenAICompatibleProvider:
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> ProviderResponse:
-        # Keep the first implementation dependency-free.  asyncio.to_thread
-        # prevents urllib from blocking the JARVIS event loop.
-        import asyncio
-
-        raw = await asyncio.to_thread(
-            self._request,
-            self._payload(
-                messages,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False,
-                **kwargs,
-            ),
+        payload = self._payload(
+            messages, tools=tools, temperature=temperature,
+            max_tokens=max_tokens, stream=False, **kwargs,
         )
-        data = json.loads(raw.decode("utf-8"))
+
+        def request() -> bytes:
+            req = urllib.request.Request(
+                f"{self.base_url}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers=self._headers(),
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"{self.provider_id} HTTP {exc.code}: {detail[:1000]}"
+                ) from exc
+
+        data = json.loads((await asyncio.to_thread(request)).decode("utf-8"))
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         return ProviderResponse(
@@ -125,36 +111,23 @@ class OpenAICompatibleProvider:
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Yield text deltas from an SSE-compatible endpoint.
-
-        The transport is intentionally small; provider-specific realtime/audio
-        protocols belong in separate adapters rather than in this LLM class.
-        """
-        import asyncio
-
+        """Yield SSE text deltas without blocking the asyncio event loop."""
         payload = self._payload(
-            messages,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-            **kwargs,
+            messages, tools=tools, temperature=temperature,
+            max_tokens=max_tokens, stream=True, **kwargs,
         )
-
-        # urllib's streaming response is consumed in a worker and forwarded
-        # through an asyncio queue, preserving back-pressure for the caller.
+        loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str | None | BaseException] = asyncio.Queue()
+
+        def put(item: str | None | BaseException) -> None:
+            asyncio.run_coroutine_threadsafe(queue.put(item), loop)
 
         def worker() -> None:
             try:
-                body = json.dumps(payload).encode("utf-8")
-                headers = {"Content-Type": "application/json"}
-                if self.api_key:
-                    headers["Authorization"] = f"Bearer {self.api_key}"
                 req = urllib.request.Request(
                     f"{self.base_url}/chat/completions",
-                    data=body,
-                    headers=headers,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=self._headers(),
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:
@@ -170,20 +143,24 @@ class OpenAICompatibleProvider:
                             delta = ((data.get("choices") or [{}])[0]
                                      .get("delta") or {}).get("content")
                             if delta:
-                                asyncio.run_coroutine_threadsafe(queue.put(delta), loop)
+                                put(delta)
                         except json.JSONDecodeError:
                             continue
             except BaseException as exc:
-                asyncio.run_coroutine_threadsafe(queue.put(exc), loop)
+                put(exc)
             finally:
-                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+                put(None)
 
-        loop = asyncio.get_running_loop()
-        await asyncio.to_thread(worker)
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+        # Start the blocking HTTP reader; consume the queue concurrently.
+        worker_task = asyncio.create_task(asyncio.to_thread(worker))
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            # The underlying urllib call will finish/timeout independently.
+            await worker_task
