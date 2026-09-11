@@ -1,6 +1,6 @@
 """Provider contracts used by the JARVIS core.
 
-Keep this module dependency-free.  Concrete providers can depend on their own
+Keep this module dependency-free. Concrete providers can depend on their own
 SDKs without forcing those SDKs onto every JARVIS installation.
 """
 
@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
 @dataclass(frozen=True)
 class ChatMessage:
     role: str
-    content: str
+    content: str | list[Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -28,11 +28,19 @@ class ProviderCapabilities:
 
 
 @dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ProviderResponse:
     text: str = ""
     raw: Any = None
     usage: Mapping[str, Any] = field(default_factory=dict)
     finish_reason: str | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 class LLMProvider(Protocol):
